@@ -8,6 +8,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from einops import rearrange, repeat
+
 
 @dataclass
 class ModelArgs:
@@ -24,6 +26,192 @@ class ModelArgs:
     dropout_p: float = 0.0
 
 
+#################
+## TITOK MODEL ##
+#################
+
+@dataclass
+class TransformerConfig:
+    n_layers: int
+    n_heads: int
+    n_embd: int
+    block_size: int
+    causal: bool = False
+    dropout: float = 0.0
+    def __post_init__(self):
+        self.head_dim = self.n_embd // self.n_heads
+
+class Attention(nn.Module):
+    def __init__(self, config: TransformerConfig):
+        super(Attention, self).__init__()
+        if "causal" not in config.__dict__: config.causal = False #HACK: for backwards compatibility with old configs
+        for k, v in config.__dict__.items(): setattr(self, k, v)
+        self.qkv = nn.Linear(self.n_embd, self.n_embd * 3)
+        if self.causal:
+            mask = torch.triu(torch.ones(config.block_size, config.block_size), diagonal=1)
+            mask = mask.masked_fill(mask == 1, float('-inf'))  # Convert 1s to -inf
+            self.register_buffer("mask", mask)
+    def forward(self, x):
+        q, k, v = rearrange(self.qkv(x), "b n (qkv h d) -> qkv b h n d", qkv=3, h=self.n_heads)
+        out = F.scaled_dot_product_attention(q, k, v, dropout_p=self.dropout, attn_mask=self.mask[:q.size(2), :q.size(2)] if self.causal else None)
+        return rearrange(out, "b h n d -> b n (h d)", h=self.n_heads)
+
+class TransformerLayer(nn.Module):
+    def __init__(self, config: TransformerConfig):
+        super(TransformerLayer, self).__init__()
+        for k, v in config.__dict__.items(): setattr(self, k, v)
+        self.multi_attn = Attention(config)
+        self.mlp = nn.Sequential(
+            nn.Linear(self.n_embd, 4 * self.n_embd),
+            nn.GELU(),
+            nn.Linear(4 * self.n_embd, self.n_embd),
+            nn.Dropout(self.dropout)
+        )
+    def forward(self, x):
+        x = x + self.multi_attn(F.layer_norm(x, (self.n_embd,)))
+        x = x + self.mlp(F.layer_norm(x, (self.n_embd,)))
+        return x
+
+class Transformer(nn.Module):
+    def __init__(self, config: TransformerConfig):
+        super(Transformer, self).__init__()
+        for k, v in config.__dict__.items(): setattr(self, k, v)
+        self.layers = nn.ModuleList([TransformerLayer(config) for _ in range(config.n_layers)])
+    def forward(self, x):
+        for layer in self.layers: x = layer(x)
+        return x
+
+def S(**kwargs): return TransformerConfig(n_layers=6, n_heads=8, n_embd=512, **kwargs)
+def B(**kwargs): return TransformerConfig(n_layers=12, n_heads=12, n_embd=768, **kwargs)
+def L(**kwargs): return TransformerConfig(n_layers=24, n_heads=16, n_embd=1024, **kwargs)
+transformer_configs = {"S": S, "B": B, "L": L}
+
+@dataclass
+class ViTConfig:
+    image_size: int
+    in_channels: int
+    patch_size: int
+    transformer: str
+    extra_tokens: int
+    dropout: float
+
+    def __post_init__(self):
+        self.n_patches = (self.image_size // self.patch_size) ** 2
+        self.patch_dim = 3 * self.patch_size ** 2
+        self.trans_config = transformer_configs[self.transformer](block_size=self.n_patches + self.extra_tokens, dropout=self.dropout)
+
+class ViT(nn.Module):
+    def __init__(self, args: ViTConfig):
+        super(ViT, self).__init__()
+        self.config = args
+        self.patch_proj = nn.Conv2d(in_channels=args.in_channels, out_channels=args.trans_config.n_embd, kernel_size=args.patch_size, stride=args.patch_size)
+        self.pos_emb = nn.Embedding(args.n_patches, args.trans_config.n_embd)
+        self.extra_emb = nn.Embedding(args.extra_tokens, args.trans_config.n_embd)
+        self.transformer = Transformer(args.trans_config)
+    def forward(self, x):
+        patch_emb = self.patch_proj(x)
+        patch_emb = rearrange(patch_emb, 'b c h w -> b (h w) c')
+        patch_emb = patch_emb + self.pos_emb(torch.arange(self.config.n_patches, device=patch_emb.device))
+
+        extra_emb = repeat(self.extra_emb.weight, 'n d -> b n d', b=x.shape[0])
+        emb = torch.cat([extra_emb, patch_emb], dim=1)
+        return self.transformer(emb)
+
+@dataclass
+class TiTokConfig:
+    image_size: int
+    patch_size: int
+    latent_tokens: int
+    codebook_size: int
+    latent_dim: int
+    transformer: str
+    def __post_init__(self):
+        self.patch_dim = self.image_size // self.patch_size
+        self.n_patches = self.patch_dim**2
+        self.enc_vit_config = ViTConfig(self.image_size, 3, self.patch_size, self.transformer, self.latent_tokens, 0.0)
+        self.n_embd = self.enc_vit_config.trans_config.n_embd
+        self.dec_vit_config = ViTConfig(self.latent_tokens, self.n_embd, 1, self.transformer, self.n_patches, 0.0)
+        self.dec_vit_config.n_patches = self.latent_tokens
+
+class TiTokEncoder(nn.Module):
+    def __init__(self, titok_config: TiTokConfig):
+        super(TiTokEncoder, self).__init__()
+        self.latent_tokens = titok_config.latent_tokens
+        self.vit = ViT(titok_config.enc_vit_config)
+        self.proj = nn.Linear(titok_config.n_embd, titok_config.latent_dim)
+    def forward(self, x):
+        out_embd = self.vit(x)[:,:self.latent_tokens]
+        latent_embd = self.proj(out_embd)
+        return latent_embd
+
+class Quantizer(nn.Module):
+    def __init__(self, titok_config: TiTokConfig):
+        super(Quantizer, self).__init__()
+        self.codebook = nn.Embedding(titok_config.codebook_size, titok_config.latent_dim)
+        self.codebook.weight.data.uniform_(-1.0 / titok_config.codebook_size, 1.0 / titok_config.codebook_size)
+    def forward(self, x):
+        x = torch.nn.functional.normalize(x, dim=-1)
+        embedding = torch.nn.functional.normalize(self.codebook.weight, dim=-1)
+        indices = torch.cdist(x, embedding).argmin(dim=-1)
+        quantized = self.codebook(indices)
+        codebook_loss = (quantized - x.detach()).pow(2).mean()
+        commitment_loss = 0.25 * (quantized.detach() - x).pow(2).mean()
+        quantize_loss = codebook_loss + commitment_loss
+        quantized = x + (quantized - x).detach() # copy gradients
+        return quantized, indices, quantize_loss
+
+class TiTokDecoder(nn.Module):
+    def __init__(self, titok_config: TiTokConfig):
+        super(TiTokDecoder, self).__init__()
+        self.config = titok_config
+        self.vit = ViT(titok_config.dec_vit_config)
+        self.quant_proj = nn.Linear(titok_config.latent_dim, titok_config.n_embd)
+        self.embd_proj = nn.Conv2d(titok_config.n_embd, 3*titok_config.patch_size**2, kernel_size=1)
+        self.conv_out = nn.Conv2d(3, 3, 3, padding=1, bias=True) # one more conv as per the original paper
+    
+    @property
+    def last_layer(self):
+        return self.conv_out.weight
+
+    def forward(self, z):
+        z = self.quant_proj(z)
+        z = rearrange(z, 'b h c -> b c h 1')
+        out_embd = self.vit(z)[:,:self.config.n_patches]
+        out_embd = rearrange(out_embd, 'b (h w) c -> b c h w', h=self.config.patch_dim, w=self.config.patch_dim)
+        image = self.embd_proj(out_embd)
+        image = rearrange(image, 'b (p1 p2 c) h w -> b c (h p1) (w p2)', p1=self.config.patch_size, p2=self.config.patch_size)
+        image = self.conv_out(image)
+        return image
+
+class TiTok(nn.Module):
+    def __init__(self, titok_config: TiTokConfig):
+        super(TiTok, self).__init__()
+        self.config = titok_config
+        self.enc = TiTokEncoder(titok_config)
+        # self.quant = Quantizer(titok_config)
+        self.quant = VectorQuantizer(titok_config.codebook_size, titok_config.latent_dim,
+                                        0.25, 0.0,
+                                        True, False)
+        # self.quant_conv = nn.Conv2d(titok_config.latent_tokens, titok_config.latent_dim, 1)
+        # self.post_quant_conv = nn.Conv2d(titok_config.latent_dim, titok_config.latent_tokens, 1)
+
+        self.decoder = TiTokDecoder(titok_config)
+    def encode(self, z): return self.quant(self.enc(z))[1]
+    def decode(self, z_quant): return self.decoder(z_quant)
+    def decode_indices(self, indices): return self.decoder(self.quant.codebook(indices))
+    def forward(self, x):
+        latent_embs = self.enc(x)
+        latent_embs = rearrange(latent_embs, 'b t d -> b d t 1')
+        # print("pre quant: ", latent_embs.shape)
+        # latent_embs = self.quant_conv(latent_embs)
+        quantized, indices, quantize_loss = self.quant(latent_embs)
+        quantized, emb_loss, info = self.quant(latent_embs)
+        # quantized = self.post_quant_conv(quantized)
+        # print(quantized.shape)
+        quantized = rearrange(quantized, 'b d t 1 -> b t d')
+        image_recon = self.decoder(quantized)
+        # return image_recon, indices, quantize_loss
+        return image_recon, emb_loss
 
 class VQModel(nn.Module):
     def __init__(self, config: ModelArgs):
@@ -41,6 +229,7 @@ class VQModel(nn.Module):
     def encode(self, x):
         h = self.encoder(x)
         h = self.quant_conv(h)
+        # print("pre quant: ", h.shape)
         quant, emb_loss, info = self.quantize(h)
         return quant, emb_loss, info
 
@@ -216,6 +405,7 @@ class VectorQuantizer(nn.Module):
         # reshape z -> (batch, height, width, channel) and flatten
         z = torch.einsum('b c h w -> b h w c', z).contiguous()
         z_flattened = z.view(-1, self.e_dim)
+        # print("z_flattened: ", z_flattened.shape)
         # distances from z to embeddings e_j (z - e)^2 = z^2 + e^2 - 2 e * z
 
         if self.l2_norm:
@@ -242,6 +432,7 @@ class VectorQuantizer(nn.Module):
             cur_len = min_encoding_indices.shape[0]
             self.codebook_used[:-cur_len] = self.codebook_used[cur_len:].clone()
             self.codebook_used[-cur_len:] = min_encoding_indices
+            exit(0)
             codebook_usage = len(torch.unique(self.codebook_used)) / self.n_e
 
         # compute loss for embedding
@@ -415,10 +606,21 @@ def compute_entropy_loss(affinity, loss_type="softmax", temperature=0.01):
 #################################################################################
 #                              VQ Model Configs                                 #
 #################################################################################
+def VQ_4(**kwargs):
+    return VQModel(ModelArgs(encoder_ch_mult=[1, 2, 2], decoder_ch_mult=[1, 2, 2], **kwargs))
+
 def VQ_8(**kwargs):
     return VQModel(ModelArgs(encoder_ch_mult=[1, 2, 2, 4], decoder_ch_mult=[1, 2, 2, 4], **kwargs))
 
 def VQ_16(**kwargs):
     return VQModel(ModelArgs(encoder_ch_mult=[1, 1, 2, 2, 4], decoder_ch_mult=[1, 1, 2, 2, 4], **kwargs))
 
-VQ_models = {'VQ-16': VQ_16, 'VQ-8': VQ_8}
+def TiTok_256(**kwargs):
+    return TiTok(TiTokConfig(image_size=256, patch_size=16, latent_tokens=256, codebook_size=16834, latent_dim=8, transformer='B'))
+
+VQ_models = {'VQ-16': VQ_16, 'VQ-8': VQ_8, 'VQ-4': VQ_4, 'TiTok-256': TiTok_256}
+
+if __name__ == "__main__":
+    titok = TiTok_256()
+    # titok = VQ_16()
+    titok.forward(torch.randn(2, 3, 256, 256))

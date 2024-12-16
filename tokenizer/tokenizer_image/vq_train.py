@@ -1,7 +1,7 @@
 # Modified from:
 #   fast-DiT: https://github.com/chuanyangjin/fast-DiT/blob/main/train.py
 #   nanoGPT: https://github.com/karpathy/nanoGPT/blob/master/model.py
-import torch
+import torch, wandb
 # the first flag below was False when we tested this script but True makes A100 training a lot faster:
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
@@ -50,6 +50,7 @@ def main(args):
 
     # Setup an experiment folder:
     if rank == 0:
+        wandb.init(project="vqgan-llamagen", config=args.__dict__)
         os.makedirs(args.results_dir, exist_ok=True)  # Make results folder (holds all experiment subfolders)
         experiment_index = len(glob(f"{args.results_dir}/*"))
         model_string_name = args.vq_model.replace("/", "-")
@@ -134,7 +135,7 @@ def main(args):
         pin_memory=True,
         drop_last=True
     )
-    logger.info(f"Dataset contains {len(dataset):,} images ({args.data_path})")
+    logger.info(f"Dataset contains {len(dataset):,} images ({args.data_path}) batch size: {args.global_batch_size} local batch size: {args.global_batch_size // dist.get_world_size()}")
     
 
     # Prepare models for training:
@@ -230,6 +231,8 @@ def main(args):
                 dist.all_reduce(avg_loss, op=dist.ReduceOp.SUM)
                 avg_loss = avg_loss.item() / dist.get_world_size()
                 logger.info(f"(step={train_steps:07d}) Train Loss: {avg_loss:.4f}, Train Steps/Sec: {steps_per_sec:.2f}")
+                if rank == 0:
+                    wandb.log({"train/loss": avg_loss, "perf/steps_per_sec": steps_per_sec})
                 # Reset monitoring variables:
                 running_loss = 0
                 log_steps = 0
@@ -298,7 +301,7 @@ if __name__ == "__main__":
     parser.add_argument("--dropout-p", type=float, default=0.0, help="dropout_p")
     parser.add_argument("--results-dir", type=str, default="results_tokenizer_image")
     parser.add_argument("--dataset", type=str, default='imagenet')
-    parser.add_argument("--image-size", type=int, choices=[256, 512], default=256)
+    parser.add_argument("--image-size", type=int, choices=[128, 256, 512], default=256)
     parser.add_argument("--epochs", type=int, default=40)
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--weight-decay", type=float, default=5e-2, help="Weight decay to use.")
@@ -313,4 +316,7 @@ if __name__ == "__main__":
     parser.add_argument("--gradient-accumulation-steps", type=int, default=1)
     parser.add_argument("--mixed-precision", type=str, default='bf16', choices=["none", "fp16", "bf16"]) 
     args = parser.parse_args()
+
+
+
     main(args)

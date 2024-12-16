@@ -1,7 +1,7 @@
 # Modified from:
 #   taming-transformers:  https://github.com/CompVis/taming-transformers
 #   muse-maskgit-pytorch: https://github.com/lucidrains/muse-maskgit-pytorch/blob/main/muse_maskgit_pytorch/vqgan_vae.py
-import torch
+import torch, wandb, os
 import torch.nn as nn
 import torch.nn.functional as F
 
@@ -135,6 +135,9 @@ class VQLoss(nn.Module):
             else:
                 disc_adaptive_weight = 1
             disc_weight = adopt_weight(self.disc_weight, global_step, threshold=self.discriminator_iter_start)
+
+            # print(f"{self.rec_weight=}, {rec_loss=} {self.perceptual_weight=}, {p_loss=}, {disc_adaptive_weight=}, {disc_weight=}, {generator_adv_loss=}")
+            # print(f"{codebook_loss=}")
             
             loss = self.rec_weight * rec_loss + \
                 self.perceptual_weight * p_loss + \
@@ -149,6 +152,13 @@ class VQLoss(nn.Module):
                             f"vq_loss: {codebook_loss[0]:.4f}, commit_loss: {codebook_loss[1]:.4f}, entropy_loss: {codebook_loss[2]:.4f}, "
                             f"codebook_usage: {codebook_loss[3]:.4f}, generator_adv_loss: {generator_adv_loss:.4f}, "
                             f"disc_adaptive_weight: {disc_adaptive_weight:.4f}, disc_weight: {disc_weight:.4f}")
+                # get rank of current gpu in multi gpu training
+                if int(os.environ.get("LOCAL_RANK")) == 0:
+                    wandb.log({"train/rec_loss": rec_loss, "train/perceptual_loss": p_loss,
+                                "train/vq_loss": codebook_loss[0], "train/commit_loss": codebook_loss[1],
+                                "train/entropy_loss": codebook_loss[2], "train/codebook_usage": codebook_loss[3],
+                                "train/generator_adv_loss": generator_adv_loss,
+                                "train/disc_adaptive_weight": disc_adaptive_weight, "train/disc_weight": disc_weight})
             return loss
 
         # discriminator update

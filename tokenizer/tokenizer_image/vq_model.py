@@ -191,7 +191,7 @@ class TiTok(nn.Module):
         # self.quant = Quantizer(titok_config)
         self.quant = VectorQuantizer(titok_config.codebook_size, titok_config.latent_dim,
                                         0.25, 0.0,
-                                        True, False)
+                                        True, True)
         # self.quant_conv = nn.Conv2d(titok_config.latent_tokens, titok_config.latent_dim, 1)
         # self.post_quant_conv = nn.Conv2d(titok_config.latent_dim, titok_config.latent_tokens, 1)
 
@@ -432,7 +432,6 @@ class VectorQuantizer(nn.Module):
             cur_len = min_encoding_indices.shape[0]
             self.codebook_used[:-cur_len] = self.codebook_used[cur_len:].clone()
             self.codebook_used[-cur_len:] = min_encoding_indices
-            exit(0)
             codebook_usage = len(torch.unique(self.codebook_used)) / self.n_e
 
         # compute loss for embedding
@@ -618,7 +617,10 @@ def VQ_16(**kwargs):
 def TiTok_256(**kwargs):
     return TiTok(TiTokConfig(image_size=256, patch_size=16, latent_tokens=256, codebook_size=16834, latent_dim=8, transformer='B'))
 
-VQ_models = {'VQ-16': VQ_16, 'VQ-8': VQ_8, 'VQ-4': VQ_4, 'TiTok-256': TiTok_256}
+def TiTok_64(**kwargs):
+    return TiTok(TiTokConfig(image_size=256, patch_size=16, latent_tokens=64, codebook_size=16834, latent_dim=8, transformer='B'))
+
+VQ_models = {'VQ-16': VQ_16, 'VQ-8': VQ_8, 'VQ-4': VQ_4, 'TiTok-256': TiTok_256, 'TiTok-64': TiTok_64}
 
 if __name__ == "__main__":
     titok = TiTok_256()

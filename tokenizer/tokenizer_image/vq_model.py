@@ -2,14 +2,15 @@
 #   taming-transformers: https://github.com/CompVis/taming-transformers
 #   maskgit: https://github.com/google-research/maskgit
 from dataclasses import dataclass, field
-from typing import List
+from typing import List, Tuple, Union
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import numpy as np
 
 from einops import rearrange, repeat
-
+from einops.layers.torch import Rearrange
 
 @dataclass
 class ModelArgs:
@@ -24,6 +25,267 @@ class ModelArgs:
     decoder_ch_mult: List[int] = field(default_factory=lambda: [1, 1, 2, 2, 4])
     z_channels: int = 256
     dropout_p: float = 0.0
+
+######################
+## ENHANCING LAYERS ##
+######################
+
+@dataclass
+class ViTVQGANConfig:
+    image_size: int
+    patch_size: int
+    codebook_size: int
+    latent_dim: int
+    transformer: str
+    def __post_init__(self):
+        self.patch_dim = self.image_size // self.patch_size
+        self.n_patches = self.patch_dim**2
+        self.latent_tokens = self.n_patches
+        self.enc_vit_config = ViTConfig(self.image_size, 3, self.patch_size, self.transformer, 0, 0.0)
+        self.n_embd = self.enc_vit_config.trans_config.n_embd
+        self.dec_vit_config = ViTConfig(self.latent_tokens, self.n_embd, 1, self.transformer, 0, 0.0)
+        self.dec_vit_config.n_patches = self.latent_tokens #HACK: is this line necessary?
+
+def get_2d_sincos_pos_embed(embed_dim, grid_size):
+    """
+    grid_size: int or (int, int) of the grid height and width
+    return:
+    pos_embed: [grid_size*grid_size, embed_dim] or [1+grid_size*grid_size, embed_dim] (w/ or w/o cls_token)
+    """
+    grid_size = (grid_size, grid_size) if type(grid_size) != tuple else grid_size
+    grid_h = np.arange(grid_size[0], dtype=np.float32)
+    grid_w = np.arange(grid_size[1], dtype=np.float32)
+    grid = np.meshgrid(grid_w, grid_h)  # here w goes first
+    grid = np.stack(grid, axis=0)
+
+    grid = grid.reshape([2, 1, grid_size[0], grid_size[1]])
+    pos_embed = get_2d_sincos_pos_embed_from_grid(embed_dim, grid)
+
+    return pos_embed
+
+
+def get_2d_sincos_pos_embed_from_grid(embed_dim, grid):
+    assert embed_dim % 2 == 0
+
+    # use half of dimensions to encode grid_h
+    emb_h = get_1d_sincos_pos_embed_from_grid(embed_dim // 2, grid[0])  # (H*W, D/2)
+    emb_w = get_1d_sincos_pos_embed_from_grid(embed_dim // 2, grid[1])  # (H*W, D/2)
+
+    emb = np.concatenate([emb_h, emb_w], axis=1) # (H*W, D)
+    return emb
+
+
+def get_1d_sincos_pos_embed_from_grid(embed_dim, pos):
+    """
+    embed_dim: output dimension for each position
+    pos: a list of positions to be encoded: size (M,)
+    out: (M, D)
+    """
+    assert embed_dim % 2 == 0
+    omega = np.arange(embed_dim // 2, dtype=float)
+    omega /= embed_dim / 2.
+    omega = 1. / 10000**omega  # (D/2,)
+
+    pos = pos.reshape(-1)  # (M,)
+    out = np.einsum('m,d->md', pos, omega)  # (M, D/2), outer product
+
+    emb_sin = np.sin(out) # (M, D/2)
+    emb_cos = np.cos(out) # (M, D/2)
+
+    emb = np.concatenate([emb_sin, emb_cos], axis=1)  # (M, D)
+    return emb
+
+
+def init_weights(m):
+    if isinstance(m, nn.Linear):
+        # we use xavier_uniform following official JAX ViT:
+        torch.nn.init.xavier_uniform_(m.weight)
+        if m.bias is not None:
+            nn.init.constant_(m.bias, 0)
+    elif isinstance(m, nn.LayerNorm):
+        nn.init.constant_(m.bias, 0)
+        nn.init.constant_(m.weight, 1.0)
+    elif isinstance(m, nn.Conv2d) or isinstance(m, nn.ConvTranspose2d):
+        w = m.weight.data
+        torch.nn.init.xavier_uniform_(w.view([w.shape[0], -1]))
+
+
+class PreNorm(nn.Module):
+    def __init__(self, dim: int, fn: nn.Module) -> None:
+        super().__init__()
+        self.norm = nn.LayerNorm(dim)
+        self.fn = fn
+
+    def forward(self, x: torch.FloatTensor, **kwargs) -> torch.FloatTensor:
+        return self.fn(self.norm(x), **kwargs)
+
+
+class FeedForward(nn.Module):
+    def __init__(self, dim: int, hidden_dim: int) -> None:
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(dim, hidden_dim),
+            nn.Tanh(),
+            nn.Linear(hidden_dim, dim)
+        )
+
+    def forward(self, x: torch.FloatTensor) -> torch.FloatTensor:
+        return self.net(x)
+
+
+class AttentionEnhancing(nn.Module):
+    def __init__(self, dim: int, heads: int = 8, dim_head: int = 64) -> None:
+        super().__init__()
+        inner_dim = dim_head *  heads
+        project_out = not (heads == 1 and dim_head == dim)
+
+        self.heads = heads
+        self.scale = dim_head ** -0.5
+
+        self.attend = nn.Softmax(dim = -1)
+        self.to_qkv = nn.Linear(dim, inner_dim * 3, bias = False)
+
+        self.to_out = nn.Linear(inner_dim, dim) if project_out else nn.Identity()
+
+    def forward(self, x: torch.FloatTensor) -> torch.FloatTensor:
+        qkv = self.to_qkv(x).chunk(3, dim = -1)
+        q, k, v = map(lambda t: rearrange(t, 'b n (h d) -> b h n d', h = self.heads), qkv)
+
+        attn = torch.matmul(q, k.transpose(-1, -2)) * self.scale
+        attn = self.attend(attn)
+
+        out = torch.matmul(attn, v)
+        out = rearrange(out, 'b h n d -> b n (h d)')
+
+        return self.to_out(out)
+
+
+class TransformerEnhancing(nn.Module):
+    def __init__(self, dim: int, depth: int, heads: int, dim_head: int, mlp_dim: int) -> None:
+        super().__init__()
+        self.layers = nn.ModuleList([])
+        for idx in range(depth):
+            layer = nn.ModuleList([PreNorm(dim, AttentionEnhancing(dim, heads=heads, dim_head=dim_head)),
+                                   PreNorm(dim, FeedForward(dim, mlp_dim))])
+            self.layers.append(layer)
+        self.norm = nn.LayerNorm(dim)
+
+    def forward(self, x: torch.FloatTensor) -> torch.FloatTensor:
+        for attn, ff in self.layers:
+            x = attn(x) + x
+            x = ff(x) + x
+
+        return self.norm(x)
+
+
+class ViTEncoder(nn.Module):
+    def __init__(self, image_size: Union[Tuple[int, int], int], patch_size: Union[Tuple[int, int], int],
+                 dim: int = 768, depth: int = 12, heads: int = 12, mlp_dim: int = 3072, channels: int = 3, dim_head: int = 64) -> None:
+        super().__init__()
+        image_height, image_width = image_size if isinstance(image_size, tuple) \
+                                    else (image_size, image_size)
+        patch_height, patch_width = patch_size if isinstance(patch_size, tuple) \
+                                    else (patch_size, patch_size)
+
+        assert image_height % patch_height == 0 and image_width % patch_width == 0, 'Image dimensions must be divisible by the patch size.'
+        en_pos_embedding = get_2d_sincos_pos_embed(dim, (image_height // patch_height, image_width // patch_width))
+
+        self.num_patches = (image_height // patch_height) * (image_width // patch_width)
+        self.patch_dim = channels * patch_height * patch_width
+
+        self.to_patch_embedding = nn.Sequential(
+            nn.Conv2d(channels, dim, kernel_size=patch_size, stride=patch_size),
+            Rearrange('b c h w -> b (h w) c'),
+        )
+        self.en_pos_embedding = nn.Parameter(torch.from_numpy(en_pos_embedding).float().unsqueeze(0), requires_grad=False)
+        self.transformer = TransformerEnhancing(dim, depth, heads, dim_head, mlp_dim)
+
+        self.apply(init_weights)
+
+    def forward(self, img: torch.FloatTensor) -> torch.FloatTensor:
+        x = self.to_patch_embedding(img)
+        x = x + self.en_pos_embedding
+        x = self.transformer(x)
+
+        return x
+
+
+class ViTDecoder(nn.Module):
+    def __init__(self, image_size: Union[Tuple[int, int], int], patch_size: Union[Tuple[int, int], int],
+                 dim: int = 768, depth: int = 12, heads: int = 12, mlp_dim: int = 3072, channels: int = 3, dim_head: int = 64) -> None:
+        super().__init__()
+        image_height, image_width = image_size if isinstance(image_size, tuple) \
+                                    else (image_size, image_size)
+        patch_height, patch_width = patch_size if isinstance(patch_size, tuple) \
+                                    else (patch_size, patch_size)
+
+        assert image_height % patch_height == 0 and image_width % patch_width == 0, 'Image dimensions must be divisible by the patch size.'
+        de_pos_embedding = get_2d_sincos_pos_embed(dim, (image_height // patch_height, image_width // patch_width))
+
+        self.num_patches = (image_height // patch_height) * (image_width // patch_width)
+        self.patch_dim = channels * patch_height * patch_width
+
+        self.transformer = TransformerEnhancing(dim, depth, heads, dim_head, mlp_dim)
+        self.de_pos_embedding = nn.Parameter(torch.from_numpy(de_pos_embedding).float().unsqueeze(0), requires_grad=False)
+        self.to_pixel = nn.Sequential(
+            Rearrange('b (h w) c -> b c h w', h=image_height // patch_height),
+            nn.ConvTranspose2d(dim, channels, kernel_size=patch_size, stride=patch_size)
+        )
+
+        self.apply(init_weights)
+
+    def forward(self, token: torch.FloatTensor) -> torch.FloatTensor:
+        x = token + self.de_pos_embedding
+        x = self.transformer(x)
+        x = self.to_pixel(x)
+
+        return x
+
+    def last_layer(self) -> nn.Parameter:
+        return self.to_pixel[-1].weight
+
+class Quantizer(nn.Module):
+    def __init__(self, config: ViTVQGANConfig):
+        super(Quantizer, self).__init__()
+        self.codebook = nn.Embedding(config.codebook_size, config.latent_dim)
+        self.codebook.weight.data.uniform_(-1.0 / config.codebook_size, 1.0 / config.codebook_size)
+    def forward(self, x):
+        x = torch.nn.functional.normalize(x, dim=-1)
+        embedding = torch.nn.functional.normalize(self.codebook.weight, dim=-1)
+        indices = torch.cdist(x, embedding).argmin(dim=-1)
+        quantized = self.codebook(indices)
+        codebook_loss = (quantized - x.detach()).pow(2).mean()
+        commitment_loss = 0.25 * (quantized.detach() - x).pow(2).mean()
+        quantize_loss = codebook_loss + commitment_loss
+        quantized = x + (quantized - x).detach() # copy gradients
+        return quantized, indices, quantize_loss
+
+class ViTVQGAN(nn.Module):
+    def __init__(self, config: ViTVQGANConfig):
+        super(ViTVQGAN, self).__init__()
+        self.config = config
+        self.encoder = ViTEncoder(config.image_size, config.patch_size) 
+        self.pre_quant_proj = nn.Linear(768, config.latent_dim)
+        # self.quant = Quantizer(config)
+        self.quant = VectorQuantizer(config.codebook_size, config.latent_dim,
+                                        0.25, 0.0,
+                                        True, True)
+        self.quant_proj = nn.Linear(config.latent_dim, 768)
+        self.decoder = ViTDecoder(config.image_size, config.patch_size)
+    def encode(self, z): return self.quant(self.encoder(z))[1]
+    def decode(self, z_quant): return self.decoder(z_quant)
+    def decode_indices(self, indices): return self.decoder(self.quant.codebook(indices))
+    def forward(self, x):
+        latent_embs = self.encoder(x)
+        latent_embs = self.pre_quant_proj(latent_embs)
+        latent_embs = rearrange(latent_embs, 'b t d -> b d t 1')
+        # quantized, indices, quantize_loss = self.quant(latent_embs)
+        quantized, emb_loss, info = self.quant(latent_embs)
+        quantized = rearrange(quantized, 'b d t 1 -> b t d')
+        quantized = self.quant_proj(quantized)
+        image_recon = self.decoder(quantized)
+        # return image_recon, indices, quantize_loss
+        return image_recon, emb_loss
 
 
 #################
@@ -167,11 +429,11 @@ class TiTokDecoder(nn.Module):
         self.vit = ViT(titok_config.dec_vit_config)
         self.quant_proj = nn.Linear(titok_config.latent_dim, titok_config.n_embd)
         self.embd_proj = nn.Conv2d(titok_config.n_embd, 3*titok_config.patch_size**2, kernel_size=1)
-        self.conv_out = nn.Conv2d(3, 3, 3, padding=1, bias=True) # one more conv as per the original paper
+        # self.conv_out = nn.Conv2d(3, 3, 3, padding=1, bias=True) # one more conv as per the original paper
     
     @property
     def last_layer(self):
-        return self.conv_out.weight
+        return self.embd_proj.weight
 
     def forward(self, z):
         z = self.quant_proj(z)
@@ -180,7 +442,7 @@ class TiTokDecoder(nn.Module):
         out_embd = rearrange(out_embd, 'b (h w) c -> b c h w', h=self.config.patch_dim, w=self.config.patch_dim)
         image = self.embd_proj(out_embd)
         image = rearrange(image, 'b (p1 p2 c) h w -> b c (h p1) (w p2)', p1=self.config.patch_size, p2=self.config.patch_size)
-        image = self.conv_out(image)
+        # image = self.conv_out(image)
         return image
 
 class TiTok(nn.Module):
@@ -204,7 +466,7 @@ class TiTok(nn.Module):
         latent_embs = rearrange(latent_embs, 'b t d -> b d t 1')
         # print("pre quant: ", latent_embs.shape)
         # latent_embs = self.quant_conv(latent_embs)
-        quantized, indices, quantize_loss = self.quant(latent_embs)
+        # quantized, indices, quantize_loss = self.quant(latent_embs)
         quantized, emb_loss, info = self.quant(latent_embs)
         # quantized = self.post_quant_conv(quantized)
         # print(quantized.shape)
@@ -620,9 +882,13 @@ def TiTok_256(**kwargs):
 def TiTok_64(**kwargs):
     return TiTok(TiTokConfig(image_size=256, patch_size=16, latent_tokens=64, codebook_size=16834, latent_dim=8, transformer='B'))
 
-VQ_models = {'VQ-16': VQ_16, 'VQ-8': VQ_8, 'VQ-4': VQ_4, 'TiTok-256': TiTok_256, 'TiTok-64': TiTok_64}
+def ViTVQGAN_16(**kwargs):
+    return ViTVQGAN(ViTVQGANConfig(image_size=256, patch_size=16, latent_dim=256, codebook_size=16834, transformer='B'))
+
+VQ_models = {'VQ-16': VQ_16, 'VQ-8': VQ_8, 'VQ-4': VQ_4, 'TiTok-256': TiTok_256, 'TiTok-64': TiTok_64, 'ViTVQGAN-16': ViTVQGAN_16}
 
 if __name__ == "__main__":
-    titok = TiTok_256()
+    titok = ViTVQGAN_16()
+    # titok = TiTok_256()
     # titok = VQ_16()
     titok.forward(torch.randn(2, 3, 256, 256))
